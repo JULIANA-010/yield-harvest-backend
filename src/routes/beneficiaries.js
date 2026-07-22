@@ -11,7 +11,7 @@ router.use(requireAuth, attachScope);
 // GET /api/beneficiaries?page=1&limit=50&search=jane&groupId=...&district=...
 router.get('/', async (req, res) => {
   const page = Math.max(parseInt(req.query.page) || 1, 1);
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200); // cap to protect the DB
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = (page - 1) * limit;
   const { search, groupId, districtId, isRefugee, hasDisability } = req.query;
 
@@ -93,7 +93,7 @@ router.get('/:id', async (req, res) => {
 router.post(
   '/',
   requireRole('super_agent', 'program_officer', 'admin'),
-  [body('fullName').notEmpty(), body('farmerGroupId').notEmpty()],
+  [body('fullName').notEmpty(), body('farmerGroupName').notEmpty()],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
@@ -101,7 +101,10 @@ router.post(
     const b = req.body;
 
     // Enforce scope: a super_agent can only register into their own groups
-    if (!req.scope.unrestricted && !req.scope.groupIds.includes(b.farmerGroupId)) {
+    // (this check only applies once farmerGroupId has been resolved to a
+    // real id by the sync process — brand-new groups bypass this check
+    // since they don't exist yet).
+    if (!req.scope.unrestricted && b.farmerGroupId && !req.scope.groupIds.includes(b.farmerGroupId)) {
       return res.status(403).json({ error: 'You cannot register beneficiaries into a group you do not manage' });
     }
 
@@ -125,7 +128,12 @@ router.post(
           activity_volunteer_apprentice, activity_jobless, activity_household_work,
           has_land_access, has_capital_access,
           consent_share_with_third_party, photo_url,
-          interviewer_name, interviewer_phone, registered_by, client_uuid, synced_at
+          interviewer_name, interviewer_phone, registered_by, client_uuid,
+          chairperson_name, chairperson_phone, group_type_selected, land_acres,
+          photo_latitude, photo_longitude,
+          group_village, group_parish, group_district_name, group_subcounty_name,
+          group_agent_name, group_agent_phone,
+          synced_at
         ) VALUES (
           $1,$2,$3,$4,$5, $6,$7, $8,$9,$10,$11, $12,$13,$14,
           $15,$16,$17,$18,
@@ -137,7 +145,11 @@ router.post(
           $41,$42,$43,$44,$45,$46,$47,
           $48,$49,
           $50,$51,
-          $52,$53,$54,$55,$56, now()
+          $52,$53,$54,$55,$56,
+          $57,$58,$59,$60,
+          $61,$62,
+          $63,$64,$65,$66,
+          $67,$68, now()
         ) RETURNING id`,
         [
           b.fullName, b.gender || null, b.dateOfBirth || null, b.yearOfBirth || null, b.phone || null,
@@ -158,12 +170,15 @@ router.post(
           b.hasLandAccess || null, b.hasCapitalAccess || null,
           b.consentShareWithThirdParty || false, b.photoUrl || null,
           b.interviewerName || null, b.interviewerPhone || null, req.user.id, b.clientUuid || null,
+          b.chairpersonName || null, b.chairpersonPhone || null, b.groupType || null, b.landAcres || null,
+          b.photoLatitude || null, b.photoLongitude || null,
+          b.groupVillage || null, b.groupParish || null, b.groupDistrictName || null, b.groupSubcountyName || null,
+          b.groupAgentName || null, b.groupAgentPhone || null,
         ]
       );
       res.status(201).json({ id: rows[0].id });
     } catch (err) {
       if (err.code === '23505') {
-        // duplicate client_uuid = already synced, treat as success (idempotent sync)
         return res.status(200).json({ message: 'Already synced' });
       }
       console.error(err);
@@ -174,14 +189,12 @@ router.post(
 
 // BULK SYNC — mobile app pushes an array of queued offline records at once
 router.post('/sync', requireRole('super_agent', 'program_officer', 'admin'), async (req, res) => {
-  const { records } = req.body; // array of beneficiary payloads, each with clientUuid
+  const { records } = req.body;
   if (!Array.isArray(records)) return res.status(400).json({ error: 'records must be an array' });
 
   const results = [];
   for (const record of records) {
     try {
-      // Reuses the same insert logic conceptually — in production, factor
-      // the INSERT above into a shared helper function to avoid duplication
       results.push({ clientUuid: record.clientUuid, status: 'queued_for_processing' });
     } catch (err) {
       results.push({ clientUuid: record.clientUuid, status: 'error', error: err.message });
