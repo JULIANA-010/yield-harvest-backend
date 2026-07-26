@@ -7,15 +7,18 @@ const { attachScope } = require('../middleware/scope');
 const router = express.Router();
 router.use(requireAuth, attachScope);
 
-// LIST beneficiaries — paginated, scoped to visible groups
-// GET /api/beneficiaries?page=1&limit=50&search=jane&groupId=...&district=...
+// LIST beneficiaries — paginated, scoped to visible groups.
+// Only currently-active group members are returned by default (removed
+// members are excluded), since this is what populates attendee pickers
+// and general listings — their historical records and past training
+// attendance remain fully intact, they simply stop appearing as current.
 router.get('/', async (req, res) => {
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = (page - 1) * limit;
   const { search, groupId, districtId, isRefugee, hasDisability } = req.query;
 
-  const conditions = [];
+  const conditions = ['active_in_group = true'];
   const params = [];
   let idx = 1;
 
@@ -47,7 +50,7 @@ router.get('/', async (req, res) => {
     params.push(`%${search}%`);
   }
 
-  const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
   try {
     const countResult = await pool.query(`SELECT COUNT(*) FROM beneficiaries ${whereClause}`, params);
@@ -72,7 +75,9 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET single beneficiary (full profile)
+// GET single beneficiary (full profile) — intentionally NOT filtered by
+// active_in_group, since a removed member's own record should still be
+// viewable directly (e.g. from a past training's attendee list).
 router.get('/:id', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM beneficiaries WHERE id = $1', [req.params.id]);
@@ -88,22 +93,20 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// CREATE beneficiary — only super_agent/program_officer/admin may profile
-// new beneficiaries, per client instructions ("Super agents do profiling")
 router.post(
   '/',
   requireRole('super_agent', 'program_officer', 'admin'),
-  [body('fullName').notEmpty(), body('farmerGroupName').notEmpty()],
+  [body('fullName').notEmpty()],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     const b = req.body;
 
-    // Enforce scope: a super_agent can only register into their own groups
-    // (this check only applies once farmerGroupId has been resolved to a
-    // real id by the sync process — brand-new groups bypass this check
-    // since they don't exist yet).
+    if (!b.farmerGroupId && !b.farmerGroupName) {
+      return res.status(400).json({ error: 'A farmer group is required' });
+    }
+
     if (!req.scope.unrestricted && b.farmerGroupId && !req.scope.groupIds.includes(b.farmerGroupId)) {
       return res.status(403).json({ error: 'You cannot register beneficiaries into a group you do not manage' });
     }
@@ -133,6 +136,7 @@ router.post(
           photo_latitude, photo_longitude,
           group_village, group_parish, group_district_name, group_subcounty_name,
           group_agent_name, group_agent_phone,
+          consent_form_signed,
           synced_at
         ) VALUES (
           $1,$2,$3,$4,$5, $6,$7, $8,$9,$10,$11, $12,$13,$14,
@@ -149,14 +153,15 @@ router.post(
           $57,$58,$59,$60,
           $61,$62,
           $63,$64,$65,$66,
-          $67,$68, now()
-        ) RETURNING id`,
+          $67,$68,
+          $69, now()
+        ) RETURNING *`,
         [
           b.fullName, b.gender || null, b.dateOfBirth || null, b.yearOfBirth || null, b.phone || null,
           b.isRefugee || false, b.ninOrRefugeeNumber || null,
           b.districtId || null, b.subcountyId || null, b.parishId || null, b.villageId || null,
           b.subcountyName || null, b.parishName || null, b.villageName || null,
-          b.farmerGroupId, b.projectSupportingProfile || null, b.hasParticipatedBefore || false, b.joinedViaCso || null,
+          b.farmerGroupId || null, b.projectSupportingProfile || null, b.hasParticipatedBefore || false, b.joinedViaCso || null,
           b.hasMobilePhone || null, b.mobileMoneyRegistered || null, b.hasBankAccount || null, b.bankName || null,
           b.isVslaOrGroupMember || false, b.vslaName || null,
           b.nextOfKinName || null, b.nextOfKinPhone || null,
@@ -174,9 +179,10 @@ router.post(
           b.photoLatitude || null, b.photoLongitude || null,
           b.groupVillage || null, b.groupParish || null, b.groupDistrictName || null, b.groupSubcountyName || null,
           b.groupAgentName || null, b.groupAgentPhone || null,
+          b.consentFormSigned || false,
         ]
       );
-      res.status(201).json({ id: rows[0].id });
+      res.status(201).json(rows[0]);
     } catch (err) {
       if (err.code === '23505') {
         return res.status(200).json({ message: 'Already synced' });
@@ -187,7 +193,27 @@ router.post(
   }
 );
 
-// BULK SYNC — mobile app pushes an array of queued offline records at once
+// REMOVE a beneficiary from their group — does not delete anything.
+// Their record and all past training attendance stay exactly as they
+// are; they simply stop appearing in future attendee lists and general
+// listings for the group.
+router.patch('/:id/remove-from-group', requireRole('super_agent', 'program_officer', 'admin'), async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT farmer_group_id FROM beneficiaries WHERE id = $1', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Beneficiary not found' });
+
+    if (!req.scope.unrestricted && !req.scope.groupIds.includes(rows[0].farmer_group_id)) {
+      return res.status(403).json({ error: 'You do not have access to this record' });
+    }
+
+    await pool.query('UPDATE beneficiaries SET active_in_group = false WHERE id = $1', [req.params.id]);
+    res.json({ message: 'Removed from group' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error removing beneficiary from group' });
+  }
+});
+
 router.post('/sync', requireRole('super_agent', 'program_officer', 'admin'), async (req, res) => {
   const { records } = req.body;
   if (!Array.isArray(records)) return res.status(400).json({ error: 'records must be an array' });

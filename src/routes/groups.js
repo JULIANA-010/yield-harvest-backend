@@ -30,7 +30,13 @@ router.get('/', async (req, res) => {
   }
 });
 
-// CREATE group — super_agent (for their own portfolio) or officer/admin
+// CREATE group — super_agent (for their own portfolio) or officer/admin.
+// Location is stored as free text (subcounty_name/parish_name/village_name)
+// rather than the older subcounty_id/parish_id/village_id columns, since
+// those reference tables were never fully populated — using them from the
+// mobile app's own local district/subcounty list would attach the wrong
+// location. district_id is still safe to use directly, since the
+// districts table is correctly and fully seeded.
 router.post(
   '/',
   requireRole('super_agent', 'program_officer', 'admin'),
@@ -40,17 +46,23 @@ router.post(
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     const g = req.body;
-    // super_agents can only create groups managed by themselves
     const managedBy = req.user.role === 'super_agent' ? req.user.id : (g.managedBy || req.user.id);
 
     try {
       const { rows } = await pool.query(
-        `INSERT INTO farmer_groups (name, group_type, district_id, subcounty_id, parish_id, village_id,
-          chairperson_name, chairperson_phone, managed_by, village_agent_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+        `INSERT INTO farmer_groups (
+          name, group_type, district_id,
+          subcounty_name, parish_name, village_name,
+          chairperson_name, chairperson_phone,
+          agent_name, agent_phone,
+          managed_by, village_agent_id
+        ) VALUES ($1,$2,$3, $4,$5,$6, $7,$8, $9,$10, $11,$12)
+        RETURNING id`,
         [
-          g.name, g.groupType || 'farmer_group', g.districtId || null, g.subcountyId || null,
-          g.parishId || null, g.villageId || null, g.chairpersonName || null, g.chairpersonPhone || null,
+          g.name, g.groupType || 'farmer_group', g.districtId || null,
+          g.subcountyName || null, g.parishName || null, g.villageName || null,
+          g.chairpersonName || null, g.chairpersonPhone || null,
+          g.agentName || null, g.agentPhone || null,
           managedBy, g.villageAgentId || null,
         ]
       );
