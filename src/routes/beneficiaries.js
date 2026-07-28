@@ -99,10 +99,6 @@ router.post(
       return res.status(400).json({ error: 'A farmer group is required' });
     }
 
-    if (!req.scope.unrestricted && b.farmerGroupId && !req.scope.groupIds.includes(b.farmerGroupId)) {
-      return res.status(403).json({ error: 'You cannot register beneficiaries into a group you do not manage' });
-    }
-
     try {
       const { rows } = await pool.query(
         `INSERT INTO beneficiaries (
