@@ -39,7 +39,7 @@ router.get('/', async (req, res) => {
 // districts table is correctly and fully seeded.
 router.post(
   '/',
-  requireRole('super_agent', 'program_officer', 'admin'),
+  requireRole('agent', 'super_agent', 'program_officer', 'admin'),
   [body('name').notEmpty()],
   async (req, res) => {
     const errors = validationResult(req);
