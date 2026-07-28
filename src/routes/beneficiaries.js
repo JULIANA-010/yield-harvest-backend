@@ -7,11 +7,6 @@ const { attachScope } = require('../middleware/scope');
 const router = express.Router();
 router.use(requireAuth, attachScope);
 
-// LIST beneficiaries — paginated, scoped to visible groups.
-// Only currently-active group members are returned by default (removed
-// members are excluded), since this is what populates attendee pickers
-// and general listings — their historical records and past training
-// attendance remain fully intact, they simply stop appearing as current.
 router.get('/', async (req, res) => {
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
@@ -75,9 +70,6 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET single beneficiary (full profile) — intentionally NOT filtered by
-// active_in_group, since a removed member's own record should still be
-// viewable directly (e.g. from a past training's attendee list).
 router.get('/:id', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM beneficiaries WHERE id = $1', [req.params.id]);
@@ -95,7 +87,7 @@ router.get('/:id', async (req, res) => {
 
 router.post(
   '/',
-  requireRole('super_agent', 'program_officer', 'admin'),
+  requireRole('agent', 'super_agent', 'program_officer', 'admin'),
   [body('fullName').notEmpty()],
   async (req, res) => {
     const errors = validationResult(req);
@@ -137,6 +129,7 @@ router.post(
           group_village, group_parish, group_district_name, group_subcounty_name,
           group_agent_name, group_agent_phone,
           consent_form_signed,
+          signature_url,
           synced_at
         ) VALUES (
           $1,$2,$3,$4,$5, $6,$7, $8,$9,$10,$11, $12,$13,$14,
@@ -154,7 +147,8 @@ router.post(
           $61,$62,
           $63,$64,$65,$66,
           $67,$68,
-          $69, now()
+          $69,
+          $70, now()
         ) RETURNING *`,
         [
           b.fullName, b.gender || null, b.dateOfBirth || null, b.yearOfBirth || null, b.phone || null,
@@ -180,6 +174,7 @@ router.post(
           b.groupVillage || null, b.groupParish || null, b.groupDistrictName || null, b.groupSubcountyName || null,
           b.groupAgentName || null, b.groupAgentPhone || null,
           b.consentFormSigned || false,
+          b.signatureUrl || null,
         ]
       );
       res.status(201).json(rows[0]);
@@ -193,10 +188,6 @@ router.post(
   }
 );
 
-// REMOVE a beneficiary from their group — does not delete anything.
-// Their record and all past training attendance stay exactly as they
-// are; they simply stop appearing in future attendee lists and general
-// listings for the group.
 router.patch('/:id/remove-from-group', requireRole('super_agent', 'program_officer', 'admin'), async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT farmer_group_id FROM beneficiaries WHERE id = $1', [req.params.id]);
