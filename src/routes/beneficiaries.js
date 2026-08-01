@@ -70,6 +70,115 @@ router.get('/', async (req, res) => {
   }
 });
 
+// Adds a month/year filter to a WHERE-conditions array + params list, if
+// both are provided and valid. Shared by /stats and /export below, so
+// "download all data" (no params) and "a specific month" behave
+// consistently between the two.
+function addPeriodFilter(conditions, params, idxRef, query, columnPrefix = '') {
+  const year = parseInt(query.year, 10);
+  const month = parseInt(query.month, 10);
+  const col = `${columnPrefix}registered_at`;
+  if (year && month && month >= 1 && month <= 12) {
+    conditions.push(`EXTRACT(YEAR FROM ${col}) = $${idxRef.i++}`);
+    params.push(year);
+    conditions.push(`EXTRACT(MONTH FROM ${col}) = $${idxRef.i++}`);
+    params.push(month);
+  } else if (year) {
+    conditions.push(`EXTRACT(YEAR FROM ${col}) = $${idxRef.i++}`);
+    params.push(year);
+  }
+}
+
+// STATS — total counts, scoped the same way as the list above, with an
+// optional ?year=&month= filter. No params = all-time totals.
+// IMPORTANT: this must stay ABOVE the "/:id" route below, since Express
+// would otherwise treat "stats" itself as an :id value.
+router.get('/stats', async (req, res) => {
+  const conditions = ['active_in_group = true'];
+  const params = [];
+  const idxRef = { i: 1 };
+
+  if (!req.scope.unrestricted) {
+    if (req.scope.groupIds.length === 0) {
+      return res.json({ total: 0, pwds: 0, refugees: 0, males: 0, females: 0 });
+    }
+    conditions.push(`farmer_group_id = ANY($${idxRef.i++})`);
+    params.push(req.scope.groupIds);
+  }
+
+  addPeriodFilter(conditions, params, idxRef, req.query);
+
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE has_disability = true) AS pwds,
+        COUNT(*) FILTER (WHERE is_refugee = true) AS refugees,
+        COUNT(*) FILTER (WHERE gender = 'male') AS males,
+        COUNT(*) FILTER (WHERE gender = 'female') AS females
+      FROM beneficiaries ${whereClause}`,
+      params
+    );
+    const r = rows[0];
+    res.json({
+      total: parseInt(r.total, 10),
+      pwds: parseInt(r.pwds, 10),
+      refugees: parseInt(r.refugees, 10),
+      males: parseInt(r.males, 10),
+      females: parseInt(r.females, 10),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error fetching beneficiary stats' });
+  }
+});
+
+// EXPORT — full list with readable district/group names, for CSV download.
+// Optional ?year=&month= filter, same as /stats. No params = all data.
+// Also must stay ABOVE "/:id". Capped at 5000 records for now — fine at
+// current scale, but will need a background/paginated approach once the
+// program grows well beyond that.
+router.get('/export', async (req, res) => {
+  const conditions = ['b.active_in_group = true'];
+  const params = [];
+  const idxRef = { i: 1 };
+
+  if (!req.scope.unrestricted) {
+    if (req.scope.groupIds.length === 0) {
+      return res.json({ data: [] });
+    }
+    conditions.push(`b.farmer_group_id = ANY($${idxRef.i++})`);
+    params.push(req.scope.groupIds);
+  }
+
+  addPeriodFilter(conditions, params, idxRef, req.query, 'b.');
+
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+        b.full_name, b.gender, b.date_of_birth, b.phone,
+        b.is_refugee, b.has_disability, b.education_level,
+        d.name AS district_name, b.subcounty_name, b.parish_name, b.village_name,
+        fg.name AS group_name, b.registered_at
+       FROM beneficiaries b
+       LEFT JOIN districts d ON b.district_id = d.id
+       LEFT JOIN farmer_groups fg ON b.farmer_group_id = fg.id
+       ${whereClause}
+       ORDER BY b.registered_at DESC
+       LIMIT 5000`,
+      params
+    );
+    res.json({ data: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error exporting beneficiaries' });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM beneficiaries WHERE id = $1', [req.params.id]);
@@ -184,7 +293,7 @@ router.post(
   }
 );
 
-router.patch('/:id/remove-from-group', requireRole('super_agent', 'program_officer', 'admin'), async (req, res) => {
+router.patch('/:id/remove-from-group', requireRole('agent', 'super_agent', 'program_officer', 'admin'), async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT farmer_group_id FROM beneficiaries WHERE id = $1', [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Beneficiary not found' });
@@ -201,7 +310,7 @@ router.patch('/:id/remove-from-group', requireRole('super_agent', 'program_offic
   }
 });
 
-router.post('/sync', requireRole('super_agent', 'program_officer', 'admin'), async (req, res) => {
+router.post('/sync', requireRole('agent', 'super_agent', 'program_officer', 'admin'), async (req, res) => {
   const { records } = req.body;
   if (!Array.isArray(records)) return res.status(400).json({ error: 'records must be an array' });
 
