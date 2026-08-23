@@ -70,10 +70,6 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Adds a month/year filter to a WHERE-conditions array + params list, if
-// both are provided and valid. Shared by /stats and /export below, so
-// "download all data" (no params) and "a specific month" behave
-// consistently between the two.
 function addPeriodFilter(conditions, params, idxRef, query, columnPrefix = '') {
   const year = parseInt(query.year, 10);
   const month = parseInt(query.month, 10);
@@ -89,10 +85,6 @@ function addPeriodFilter(conditions, params, idxRef, query, columnPrefix = '') {
   }
 }
 
-// STATS — total counts, scoped the same way as the list above, with an
-// optional ?year=&month= filter. No params = all-time totals.
-// IMPORTANT: this must stay ABOVE the "/:id" route below, since Express
-// would otherwise treat "stats" itself as an :id value.
 router.get('/stats', async (req, res) => {
   const conditions = ['active_in_group = true'];
   const params = [];
@@ -108,6 +100,11 @@ router.get('/stats', async (req, res) => {
 
   addPeriodFilter(conditions, params, idxRef, req.query);
 
+  if (req.query.projectName) {
+    conditions.push(`fg.project_name = $${idxRef.i++}`);
+    params.push(req.query.projectName);
+  }
+
   const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
   try {
@@ -118,7 +115,9 @@ router.get('/stats', async (req, res) => {
         COUNT(*) FILTER (WHERE is_refugee = true) AS refugees,
         COUNT(*) FILTER (WHERE gender = 'male') AS males,
         COUNT(*) FILTER (WHERE gender = 'female') AS females
-      FROM beneficiaries ${whereClause}`,
+      FROM beneficiaries
+      LEFT JOIN farmer_groups fg ON beneficiaries.farmer_group_id = fg.id
+      ${whereClause}`,
       params
     );
     const r = rows[0];
@@ -135,11 +134,6 @@ router.get('/stats', async (req, res) => {
   }
 });
 
-// EXPORT — full list with readable district/group names, for CSV download.
-// Optional ?year=&month= filter, same as /stats. No params = all data.
-// Also must stay ABOVE "/:id". Capped at 5000 records for now — fine at
-// current scale, but will need a background/paginated approach once the
-// program grows well beyond that.
 router.get('/export', async (req, res) => {
   const conditions = ['b.active_in_group = true'];
   const params = [];
@@ -155,6 +149,11 @@ router.get('/export', async (req, res) => {
 
   addPeriodFilter(conditions, params, idxRef, req.query, 'b.');
 
+  if (req.query.projectName) {
+    conditions.push(`fg.project_name = $${idxRef.i++}`);
+    params.push(req.query.projectName);
+  }
+
   const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
   try {
@@ -163,10 +162,13 @@ router.get('/export', async (req, res) => {
         b.full_name, b.gender, b.date_of_birth, b.phone,
         b.is_refugee, b.has_disability, b.education_level,
         d.name AS district_name, b.subcounty_name, b.parish_name, b.village_name,
-        fg.name AS group_name, b.registered_at
+        fg.name AS group_name, fg.project_name AS project_name,
+        u.full_name AS registered_by_name,
+        b.registered_at
        FROM beneficiaries b
        LEFT JOIN districts d ON b.district_id = d.id
        LEFT JOIN farmer_groups fg ON b.farmer_group_id = fg.id
+       LEFT JOIN users u ON b.registered_by = u.id
        ${whereClause}
        ORDER BY b.registered_at DESC
        LIMIT 5000`,

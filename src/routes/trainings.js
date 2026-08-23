@@ -7,7 +7,6 @@ const { attachScope } = require('../middleware/scope');
 const router = express.Router();
 router.use(requireAuth, attachScope);
 
-// LIST training sessions visible to current user
 router.get('/', async (req, res) => {
   try {
     let query = `SELECT t.*, g.name AS group_name
@@ -30,8 +29,6 @@ router.get('/', async (req, res) => {
   }
 });
 
-// CREATE a training session + attendance list in one call
-// (mirrors the paper form: header info + up to N participant rows)
 router.post(
   '/',
   [body('farmerGroupId').notEmpty(), body('activityDate').notEmpty()],
@@ -52,19 +49,21 @@ router.post(
         `INSERT INTO training_sessions (
           farmer_group_id, activity_date, activity_description, training_topics,
           activity_venue, district_id, subcounty_id, village_agent_id, village_agent_phone,
-          facilitator_name, recorded_by, client_uuid, synced_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now())
+          facilitator_name, recorded_by, client_uuid,
+          hard_copy_photo_url,
+          synced_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, $13, now())
         RETURNING id`,
         [
           t.farmerGroupId, t.activityDate, t.activityDescription || null, t.trainingTopics || null,
           t.activityVenue || null, t.districtId || null, t.subcountyId || null,
           t.villageAgentId || null, t.villageAgentPhone || null, t.facilitatorName || null,
           req.user.id, t.clientUuid || null,
+          t.hardCopyPhotoUrl || null,
         ]
       );
       const sessionId = sessionResult.rows[0].id;
 
-      // attendance: array of { beneficiaryId, isPwdSnapshot, isRefugeeSnapshot, attestationNo, signed }
       if (Array.isArray(t.attendance)) {
         for (const a of t.attendance) {
           await client.query(

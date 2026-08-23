@@ -31,12 +31,6 @@ router.get('/', async (req, res) => {
 });
 
 // CREATE group — super_agent (for their own portfolio) or officer/admin.
-// Location is stored as free text (subcounty_name/parish_name/village_name)
-// rather than the older subcounty_id/parish_id/village_id columns, since
-// those reference tables were never fully populated — using them from the
-// mobile app's own local district/subcounty list would attach the wrong
-// location. district_id is still safe to use directly, since the
-// districts table is correctly and fully seeded.
 router.post(
   '/',
   requireRole('agent', 'super_agent', 'program_officer', 'admin'),
@@ -55,8 +49,9 @@ router.post(
           subcounty_name, parish_name, village_name,
           chairperson_name, chairperson_phone,
           agent_name, agent_phone,
-          managed_by, village_agent_id
-        ) VALUES ($1,$2,$3, $4,$5,$6, $7,$8, $9,$10, $11,$12)
+          managed_by, village_agent_id,
+          project_name
+        ) VALUES ($1,$2,$3, $4,$5,$6, $7,$8, $9,$10, $11,$12, $13)
         RETURNING id`,
         [
           g.name, g.groupType || 'farmer_group', g.districtId || null,
@@ -64,6 +59,7 @@ router.post(
           g.chairpersonName || null, g.chairpersonPhone || null,
           g.agentName || null, g.agentPhone || null,
           managedBy, g.villageAgentId || null,
+          g.projectName || null,
         ]
       );
       res.status(201).json({ id: rows[0].id });
