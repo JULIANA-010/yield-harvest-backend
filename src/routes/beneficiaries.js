@@ -209,6 +209,11 @@ router.post(
     if (!b.farmerGroupId && !b.farmerGroupName) {
       return res.status(400).json({ error: 'A farmer group is required' });
     }
+        // The group decides the project, so people can only register participants into
+    // groups that belong to the project(s) they are assigned to.
+    if (b.farmerGroupId && !req.scope.unrestricted && !req.scope.groupIds.includes(b.farmerGroupId)) {
+      return res.status(403).json({ error: 'You cannot register participants into a group outside your projects' });
+    }
 
     try {
       const { rows } = await pool.query(

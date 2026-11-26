@@ -9,6 +9,7 @@ const beneficiaryRoutes = require('./routes/beneficiaries');
 const groupRoutes = require('./routes/groups');
 const trainingRoutes = require('./routes/trainings');
 const demoRoutes = require('./routes/demos');
+const projectRoutes = require('./routes/projects');
 const uploadRoutes = require('./routes/upload');
 
 const app = express();
@@ -34,6 +35,7 @@ app.use('/api/beneficiaries', beneficiaryRoutes);
 app.use('/api/groups', groupRoutes);
 app.use('/api/trainings', trainingRoutes);
 app.use('/api/demos', demoRoutes);
+app.use('/api/projects', projectRoutes);
 app.use('/api/upload', uploadRoutes);
 
 // central error handler

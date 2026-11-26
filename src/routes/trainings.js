@@ -3,6 +3,7 @@ const { body, validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { attachScope } = require('../middleware/scope');
+const { checkProjectChoice } = require('../middleware/projects');
 
 const router = express.Router();
 router.use(requireAuth, attachScope);
@@ -91,11 +92,17 @@ router.get('/agent-roster', requireRole(...TRAINING_ROLES), async (req, res) => 
 router.get('/agent', requireRole(...TRAINING_ROLES), async (req, res) => {
   try {
     const params = [];
-    let where = '';
+    const conditions = [];
     if (req.user.role === 'super_agent') {
       params.push(req.user.id);
-      where = 'WHERE s.recorded_by = $1';
+      conditions.push(`s.recorded_by = $${params.length}`);
     }
+    // Only trainings from the person's own project(s) (admins see all).
+    if (req.user.projectNames !== null) {
+      params.push(req.user.projectNames);
+      conditions.push(`s.project_name = ANY($${params.length})`);
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const { rows } = await pool.query(
       `SELECT s.*,
               u.full_name AS recorded_by_name,
@@ -130,6 +137,9 @@ router.post(
       return res.status(400).json({ error: 'One or more attendee ids are invalid' });
     }
 
+    const projectProblem = await checkProjectChoice(req.user, t.projectName);
+    if (projectProblem) return res.status(projectProblem.status).json({ error: projectProblem.error });
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -155,7 +165,7 @@ router.post(
           req.user.id,
           t.facilitatorName || null,
           t.hardCopyPhotoUrl || null,
-          t.projectName || null,
+          t.projectName.trim(),
           t.clientUuid || null,
         ]
       );

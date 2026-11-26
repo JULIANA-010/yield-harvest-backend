@@ -5,6 +5,10 @@ const pool = require('../config/db');
 // database on every request. This is what makes "removing an agent"
 // actually take effect immediately, instead of the agent staying logged
 // in for up to 7 days until their old token naturally expires.
+//
+// It also loads the projects the person is assigned to:
+//   req.user.projectNames === null  -> admin, can see every project
+//   req.user.projectNames === [...] -> only these projects (may be empty)
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
@@ -15,12 +19,21 @@ async function requireAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
 
-    const { rows } = await pool.query('SELECT status FROM users WHERE id = $1', [payload.id]);
+    const { rows } = await pool.query('SELECT status, role FROM users WHERE id = $1', [payload.id]);
     if (!rows[0] || rows[0].status !== 'active') {
       return res.status(403).json({ error: 'Your account is no longer active. Please contact your administrator.' });
     }
 
-    req.user = payload;
+    let projectNames = null;
+    if (rows[0].role !== 'admin') {
+      const projectRows = await pool.query(
+        'SELECT project_name FROM user_projects WHERE user_id = $1 ORDER BY project_name',
+        [payload.id]
+      );
+      projectNames = projectRows.rows.map((r) => r.project_name);
+    }
+
+    req.user = { ...payload, projectNames };
     next();
   } catch (err) {
     if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {

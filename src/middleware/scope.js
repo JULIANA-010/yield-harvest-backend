@@ -1,50 +1,55 @@
 const pool = require('../config/db');
 
 /**
- * Visibility rules confirmed by the client:
- *  - agent / super_agent: can only see the farmer groups they manage
- *    (an agent's "managed groups" = groups where managed_by = their own id,
- *    OR groups managed by the super_agent they report to, depending on how
- *    the client wants day-to-day work split — currently modelled as:
- *    super_agents own groups directly; regular agents are attached to a
- *    super_agent and inherit that super_agent's group list for read access,
- *    but only super_agents can create new beneficiary profiles).
- *  - program_officer / admin: see everything, all districts.
+ * Visibility rules:
+ *  - admin: sees everything, every project.
+ *  - program_officer: sees every farmer group in the project(s) they are assigned to.
+ *  - super_agent: sees the farmer groups they manage, in their assigned projects.
+ *  - agent: inherits the groups of the super agent they report to, in their assigned projects.
  *
- * This middleware attaches `req.scope = { groupIds: [...] | null }`
- * where null means "no restriction" (program_officer/admin).
+ * A person assigned to no project sees nothing.
+ *
+ * Attaches req.scope = { groupIds: [...] | null, unrestricted, projectNames: [...] | null }
+ * where groupIds null / unrestricted true means "no restriction" (admin only).
  */
 async function attachScope(req, res, next) {
   try {
-    const { id, role, supervisorId } = req.user;
+    const { id, role, supervisorId, projectNames } = req.user;
 
-    if (role === 'program_officer' || role === 'admin') {
-      req.scope = { groupIds: null, unrestricted: true };
+    if (role === 'admin') {
+      req.scope = { groupIds: null, unrestricted: true, projectNames: null };
       return next();
     }
 
-    if (role === 'super_agent') {
-      const { rows } = await pool.query(
-        'SELECT id FROM farmer_groups WHERE managed_by = $1',
-        [id]
-      );
-      req.scope = { groupIds: rows.map(r => r.id), unrestricted: false };
+    const projects = projectNames || [];
+    if (projects.length === 0) {
+      req.scope = { groupIds: [], unrestricted: false, projectNames: [] };
       return next();
     }
 
-    if (role === 'agent') {
+    let rows;
+    if (role === 'program_officer') {
+      ({ rows } = await pool.query(
+        'SELECT id FROM farmer_groups WHERE project_name = ANY($1)',
+        [projects]
+      ));
+    } else if (role === 'super_agent') {
+      ({ rows } = await pool.query(
+        'SELECT id FROM farmer_groups WHERE managed_by = $1 AND project_name = ANY($2)',
+        [id, projects]
+      ));
+    } else if (role === 'agent') {
       // regular agents inherit their supervising super agent's groups
       const ownerId = supervisorId || id;
-      const { rows } = await pool.query(
-        'SELECT id FROM farmer_groups WHERE managed_by = $1',
-        [ownerId]
-      );
-      req.scope = { groupIds: rows.map(r => r.id), unrestricted: false };
-      return next();
+      ({ rows } = await pool.query(
+        'SELECT id FROM farmer_groups WHERE managed_by = $1 AND project_name = ANY($2)',
+        [ownerId, projects]
+      ));
+    } else {
+      rows = [];
     }
 
-    // unknown role - default to no access
-    req.scope = { groupIds: [], unrestricted: false };
+    req.scope = { groupIds: rows.map((r) => r.id), unrestricted: false, projectNames: projects };
     next();
   } catch (err) {
     next(err);

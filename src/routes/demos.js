@@ -2,6 +2,7 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { requireAuth, requireRole } = require('../middleware/auth');
+const { canAccessProject, checkProjectChoice } = require('../middleware/projects');
 
 const router = express.Router();
 
@@ -41,11 +42,17 @@ const validators = [
 router.get('/', async (req, res) => {
   try {
     const params = [];
-    let where = '';
+    const conditions = [];
     if (req.query.project) {
       params.push(req.query.project);
-      where = 'WHERE project_name = $1';
+      conditions.push(`project_name = $${params.length}`);
     }
+    // Only demos from the person's own project(s) (admins see all).
+    if (req.user.projectNames !== null) {
+      params.push(req.user.projectNames);
+      conditions.push(`project_name = ANY($${params.length})`);
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const { rows } = await pool.query(
       `SELECT ${DEMO_COLUMNS}
@@ -90,6 +97,10 @@ router.post('/', validators, async (req, res) => {
   if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
   const d = req.body;
+
+  const projectProblem = await checkProjectChoice(req.user, d.projectName);
+  if (projectProblem) return res.status(projectProblem.status).json({ error: projectProblem.error });
+
   try {
     const { rows } = await pool.query(
       `INSERT INTO demo_establishments (
@@ -107,7 +118,7 @@ router.post('/', validators, async (req, res) => {
         d.hostName.trim(), d.valueChain.trim(), d.districtName.trim(),
         d.subcountyName || null, d.parishName || null, d.villageName || null,
         d.hostPhone || null, d.hostContactPerson || null, d.altPhone || null,
-        d.projectName || 'GOAL',
+        d.projectName.trim(),
         req.user.id,
         d.establishedDate || null,
         toNumberOrNull(d.latitude), toNumberOrNull(d.longitude),
@@ -128,7 +139,18 @@ router.patch('/:id', validators, async (req, res) => {
   if (!errors.isEmpty()) return res.status(400).json({ error: errors.array()[0].msg });
 
   const d = req.body;
+
+  const projectProblem = await checkProjectChoice(req.user, d.projectName);
+  if (projectProblem) return res.status(projectProblem.status).json({ error: projectProblem.error });
+
   try {
+    // The demo itself must also belong to one of the person's projects.
+    const existing = await pool.query('SELECT project_name FROM demo_establishments WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Demo not found' });
+    if (!canAccessProject(req.user, existing.rows[0].project_name)) {
+      return res.status(403).json({ error: 'This demo belongs to a project you are not assigned to' });
+    }
+
     const { rows } = await pool.query(
       `UPDATE demo_establishments SET
          host_name = $1, value_chain = $2, district_name = $3,
@@ -147,7 +169,7 @@ router.patch('/:id', validators, async (req, res) => {
         d.hostName.trim(), d.valueChain.trim(), d.districtName.trim(),
         d.subcountyName || null, d.parishName || null, d.villageName || null,
         d.hostPhone || null, d.hostContactPerson || null, d.altPhone || null,
-        d.projectName || 'GOAL',
+        d.projectName.trim(),
         d.establishedDate || null,
         toNumberOrNull(d.latitude), toNumberOrNull(d.longitude),
         d.photoUrl || null, d.notes || null,

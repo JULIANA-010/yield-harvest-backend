@@ -3,23 +3,30 @@ const { body, validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { requireAuth, requireRole } = require('../middleware/auth');
 const { attachScope } = require('../middleware/scope');
+const { checkProjectChoice } = require('../middleware/projects');
 
 const router = express.Router();
 router.use(requireAuth, attachScope);
 
-// LIST groups visible to the current user
+// LIST groups visible to the current user (optionally for one project)
 router.get('/', async (req, res) => {
   try {
     let query = `SELECT g.*, d.name AS district_name
                  FROM farmer_groups g
                  LEFT JOIN districts d ON g.district_id = d.id`;
     const params = [];
+    const conditions = [];
 
     if (!req.scope.unrestricted) {
       if (req.scope.groupIds.length === 0) return res.json([]);
-      query += ' WHERE g.id = ANY($1)';
       params.push(req.scope.groupIds);
+      conditions.push(`g.id = ANY($${params.length})`);
     }
+    if (req.query.projectName) {
+      params.push(req.query.projectName);
+      conditions.push(`g.project_name = $${params.length}`);
+    }
+    if (conditions.length > 0) query += ` WHERE ${conditions.join(' AND ')}`;
     query += ' ORDER BY g.name';
 
     const { rows } = await pool.query(query, params);
@@ -31,6 +38,8 @@ router.get('/', async (req, res) => {
 });
 
 // CREATE group — super_agent (for their own portfolio) or officer/admin.
+// The group is registered under one project, and every participant registered in
+// it belongs to that project.
 router.post(
   '/',
   requireRole('agent', 'super_agent', 'program_officer', 'admin'),
@@ -40,6 +49,10 @@ router.post(
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     const g = req.body;
+
+    const projectProblem = await checkProjectChoice(req.user, g.projectName);
+    if (projectProblem) return res.status(projectProblem.status).json({ error: projectProblem.error });
+
     const managedBy = req.user.role === 'super_agent' ? req.user.id : (g.managedBy || req.user.id);
 
     try {
@@ -59,7 +72,7 @@ router.post(
           g.chairpersonName || null, g.chairpersonPhone || null,
           g.agentName || null, g.agentPhone || null,
           managedBy, g.villageAgentId || null,
-          g.projectName || null,
+          g.projectName.trim(),
         ]
       );
       res.status(201).json({ id: rows[0].id });

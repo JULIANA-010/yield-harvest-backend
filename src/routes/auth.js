@@ -7,6 +7,43 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 
 const router = express.Router();
 
+// ---- project helpers -------------------------------------------------------
+// Projects a person can work with: admins get every project.
+async function loadProjectsFor(userId, role) {
+  if (role === 'admin') {
+    const { rows } = await pool.query('SELECT name, label FROM projects ORDER BY sort_order, name');
+    return rows;
+  }
+  const { rows } = await pool.query(
+    `SELECT p.name, p.label
+     FROM user_projects up JOIN projects p ON p.name = up.project_name
+     WHERE up.user_id = $1
+     ORDER BY p.sort_order, p.name`,
+    [userId]
+  );
+  return rows;
+}
+
+// Accepts an array of project names; returns the cleaned list, or null if any is unknown.
+async function validProjectNames(names) {
+  if (!Array.isArray(names)) return null;
+  const cleaned = Array.from(new Set(names.map((n) => String(n).trim()).filter(Boolean)));
+  if (cleaned.length === 0) return [];
+  const { rows } = await pool.query('SELECT name FROM projects WHERE name = ANY($1::text[])', [cleaned]);
+  return rows.length === cleaned.length ? cleaned : null;
+}
+
+async function replaceUserProjects(client, userId, names) {
+  await client.query('DELETE FROM user_projects WHERE user_id = $1', [userId]);
+  if (names.length > 0) {
+    await client.query(
+      `INSERT INTO user_projects (user_id, project_name)
+       SELECT $1, p.name FROM projects p WHERE p.name = ANY($2::text[])`,
+      [userId, names]
+    );
+  }
+}
+
 router.post(
   '/login',
   [body('phone').notEmpty(), body('password').notEmpty()],
@@ -46,6 +83,8 @@ router.post(
         { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
       );
 
+      const projects = await loadProjectsFor(user.id, user.role);
+
       res.json({
         token,
         user: {
@@ -53,6 +92,7 @@ router.post(
           fullName: user.full_name,
           phone: user.phone,
           role: user.role,
+          projects,
         },
       });
     } catch (err) {
@@ -111,22 +151,40 @@ router.post(
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const { fullName, phone, email, password, role, supervisorId, districtId } = req.body;
+    const { fullName, phone, email, password, role, supervisorId, districtId, projects } = req.body;
+
+    // Everyone except admins must be assigned to at least one project.
+    let projectNames = [];
+    if (role !== 'admin') {
+      projectNames = await validProjectNames(projects);
+      if (projectNames === null) return res.status(400).json({ error: 'One or more projects are not valid' });
+      if (projectNames.length === 0) {
+        return res.status(400).json({ error: 'Please select at least one project for this account' });
+      }
+    }
+
+    const client = await pool.connect();
     try {
+      await client.query('BEGIN');
       const passwordHash = await bcrypt.hash(password, 10);
-      const { rows } = await pool.query(
+      const { rows } = await client.query(
         `INSERT INTO users (full_name, phone, email, password_hash, role, supervisor_id, district_id, status, is_active)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', TRUE)
          RETURNING id, full_name, phone, role`,
         [fullName, phone, email || null, passwordHash, role, supervisorId || null, districtId || null]
       );
+      await replaceUserProjects(client, rows[0].id, projectNames);
+      await client.query('COMMIT');
       res.status(201).json(rows[0]);
     } catch (err) {
+      await client.query('ROLLBACK');
       if (err.code === '23505') {
         return res.status(409).json({ error: 'A user with this phone number already exists' });
       }
       console.error(err);
       res.status(500).json({ error: 'Server error creating user' });
+    } finally {
+      client.release();
     }
   }
 );
@@ -146,13 +204,28 @@ router.get('/pending', requireAuth, requireRole('admin'), async (req, res) => {
 
 router.get('/active', requireAuth, requireRole('admin', 'program_officer'), async (req, res) => {
   try {
+    // Admins see everyone. A program officer only sees people working on their own project(s).
+    const params = [];
+    let projectFilter = '';
+    if (req.user.projectNames !== null) {
+      params.push(req.user.projectNames);
+      projectFilter = `AND EXISTS (SELECT 1 FROM user_projects up2
+                                   WHERE up2.user_id = u.id AND up2.project_name = ANY($1))`;
+    }
+
     const { rows } = await pool.query(
       `SELECT u.id, u.full_name, u.phone, u.role, u.district_id, u.supervisor_id, u.created_at,
-              s.full_name AS supervisor_name
+              s.full_name AS supervisor_name,
+              COALESCE(
+                (SELECT array_agg(up.project_name ORDER BY up.project_name)
+                 FROM user_projects up WHERE up.user_id = u.id),
+                ARRAY[]::varchar[]
+              ) AS projects
        FROM users u
        LEFT JOIN users s ON u.supervisor_id = s.id
-       WHERE u.status = 'active'
-       ORDER BY u.role, u.full_name`
+       WHERE u.status = 'active' ${projectFilter}
+       ORDER BY u.role, u.full_name`,
+      params
     );
     res.json(rows);
   } catch (err) {
@@ -174,9 +247,10 @@ router.get('/super-agents', requireAuth, requireRole('admin'), async (req, res) 
 });
 
 router.patch('/users/:id/approve', requireAuth, requireRole('admin'), async (req, res) => {
-  const { supervisorId } = req.body;
+  const { supervisorId, projects } = req.body;
+  const client = await pool.connect();
   try {
-    const { rows: existingRows } = await pool.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
+    const { rows: existingRows } = await client.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
     const target = existingRows[0];
     if (!target) return res.status(404).json({ error: 'Account not found' });
     if (target.status !== 'pending') {
@@ -186,15 +260,57 @@ router.patch('/users/:id/approve', requireAuth, requireRole('admin'), async (req
       return res.status(400).json({ error: 'A supervising Super Agent must be selected for this agent' });
     }
 
-    const { rows } = await pool.query(
+    const projectNames = await validProjectNames(projects);
+    if (projectNames === null) return res.status(400).json({ error: 'One or more projects are not valid' });
+    if (projectNames.length === 0) {
+      return res.status(400).json({ error: 'Please select at least one project for this account' });
+    }
+
+    await client.query('BEGIN');
+    const { rows } = await client.query(
       `UPDATE users SET status = 'active', is_active = TRUE, supervisor_id = $1 WHERE id = $2
        RETURNING id, full_name, phone, role, status`,
       [target.role === 'agent' ? supervisorId : null, req.params.id]
     );
+    await replaceUserProjects(client, req.params.id, projectNames);
+    await client.query('COMMIT');
     res.json(rows[0]);
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error(err);
     res.status(500).json({ error: 'Server error approving account' });
+  } finally {
+    client.release();
+  }
+});
+
+// CHANGE WHICH PROJECTS A PERSON WORKS ON — admin only
+router.put('/users/:id/projects', requireAuth, requireRole('admin'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows: existingRows } = await client.query('SELECT id, role FROM users WHERE id = $1', [req.params.id]);
+    const target = existingRows[0];
+    if (!target) return res.status(404).json({ error: 'Account not found' });
+    if (target.role === 'admin') {
+      return res.status(400).json({ error: 'Admins can always see every project' });
+    }
+
+    const projectNames = await validProjectNames(req.body.projects);
+    if (projectNames === null) return res.status(400).json({ error: 'One or more projects are not valid' });
+    if (projectNames.length === 0) {
+      return res.status(400).json({ error: 'Please select at least one project' });
+    }
+
+    await client.query('BEGIN');
+    await replaceUserProjects(client, req.params.id, projectNames);
+    await client.query('COMMIT');
+    res.json({ id: req.params.id, projects: projectNames });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Server error updating projects' });
+  } finally {
+    client.release();
   }
 });
 
